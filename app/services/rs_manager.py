@@ -48,8 +48,8 @@ class RealSenseManager:
         self.colorizer.set_option(rs.option.max_distance, 6.0) # Maximum distance (meters)
         
         self.threshold_filter = rs.threshold_filter()
-        self.threshold_filter.set_option(rs.option.min_distance, 0.1) # Min distance 0.1m
-        self.threshold_filter.set_option(rs.option.max_distance, 4.0) # Max distance 4.0m
+        self.threshold_filter.set_option(rs.option.min_distance, 0.5) # Min distance 0.5m
+        self.threshold_filter.set_option(rs.option.max_distance, 6.0) # Max distance 6.0m
 
         self.metadata_socket_server = MetadataSocketServer(sio, self)
 
@@ -746,6 +746,15 @@ class RealSenseManager:
                                     depth_normalized = cv2.normalize(depth_image, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
                                     # Apply Inferno colormap
                                     depth_colormap = cv2.applyColorMap(depth_normalized, cv2.COLORMAP_INFERNO)
+                                    
+                                    # integrated edge detection
+                                    # Apply Canny edge detection
+                                    edges = cv2.Canny(depth_normalized, 100, 200)
+                                    # Dilate edges slightly to make them more visible
+                                    edges = cv2.dilate(edges, None)
+                                    # Overlay edges on the colormap (White edges)
+                                    depth_colormap[edges > 0] = [255, 255, 255]
+
                                     # Convert BGR to RGB (OpenCV is BGR, WebRTC expects RGB)
                                     frame = cv2.cvtColor(depth_colormap, cv2.COLOR_BGR2RGB)
                                     
