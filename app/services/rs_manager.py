@@ -749,11 +749,11 @@ class RealSenseManager:
                                     
                                     # integrated edge detection
                                     # Apply Canny edge detection
-                                    edges = cv2.Canny(depth_normalized, 100, 200)
+                                    edges = cv2.Canny(depth_normalized, 50, 150)
                                     # Dilate edges slightly to make them more visible
                                     edges = cv2.dilate(edges, None)
-                                    # Overlay edges on the colormap (White edges)
-                                    depth_colormap[edges > 0] = [255, 255, 255]
+                                    # Overlay edges on the colormap (Black edges)
+                                    depth_colormap[edges > 0] = [0, 0, 0]
 
                                     # Convert BGR to RGB (OpenCV is BGR, WebRTC expects RGB)
                                     frame = cv2.cvtColor(depth_colormap, cv2.COLOR_BGR2RGB)
