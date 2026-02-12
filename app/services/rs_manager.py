@@ -749,7 +749,7 @@ class RealSenseManager:
                                     
                                     # integrated edge detection
                                     # Apply Canny edge detection
-                                    edges = cv2.Canny(depth_normalized, 50, 150)
+                                    edges = cv2.Canny(depth_normalized, 100, 150)
                                     # Dilate edges slightly to make them more visible
                                     edges = cv2.dilate(edges, None)
                                     # Overlay edges on the colormap (Black edges)
