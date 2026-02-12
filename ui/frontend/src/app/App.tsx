@@ -132,24 +132,10 @@ export default function App() {
         )}
 
         {/* Image Views Row - RGB, Depth, Point Cloud */}
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-          <Card className="bg-slate-900/50 border-slate-800 backdrop-blur">
-            <CardContent className="p-4 h-[320px]">
-              <RGBView isActive={isStreaming} stream={rgbStream} />
-            </CardContent>
-          </Card>
-
-          <Card className="bg-slate-900/50 border-slate-800 backdrop-blur">
-            <CardContent className="p-4 h-[320px]">
-              <DepthView isActive={isStreaming} stream={depthStream} />
-            </CardContent>
-          </Card>
-
-          <Card className="bg-slate-900/50 border-slate-800 backdrop-blur">
-            <CardContent className="p-4 h-[320px]">
-              <PointCloudView isActive={isStreaming} points={pointCloudData} />
-            </CardContent>
-          </Card>
+        <div className="grid grid-cols-3 gap-4 h-[280px] w-full">
+          <RGBView isActive={isStreaming} stream={rgbStream} />
+          <DepthView isActive={isStreaming} stream={depthStream} />
+          <PointCloudView isActive={isStreaming} points={pointCloudData} />
         </div>
 
         {/* Main Layout */}
