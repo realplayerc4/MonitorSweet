@@ -731,9 +731,19 @@ class RealSenseManager:
                                 if stream_type.lower() == "depth":
                                     # Use the filtered depth_frame if it exists
                                     frame_data = depth_frame if depth_frame else frames.get_depth_frame()
-                                    frame = (
-                                        self.colorizer.colorize(frame_data).get_data()
-                                    )  # assuming no throw if 'not frame'
+                                    # Convert to numpy array
+                                    depth_image = np.asanyarray(frame_data.get_data())
+                                    # Normalize depth image to 0-255 range for visualization
+                                    # Use a reasonable max distance (e.g. 5 meters = 5000mm) or dynamic range
+                                    # dynamic: cv2.normalize(depth_image, None, 0, 255, cv2.NORM_MINMAX)
+                                    # But dynamic can flicker. Let's use adaptive histogram or simple scaling.
+                                    # Simple min-max normalization for full range utilization:
+                                    depth_normalized = cv2.normalize(depth_image, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
+                                    # Apply Inferno colormap
+                                    depth_colormap = cv2.applyColorMap(depth_normalized, cv2.COLORMAP_INFERNO)
+                                    # Convert BGR to RGB (OpenCV is BGR, WebRTC expects RGB)
+                                    frame = cv2.cvtColor(depth_colormap, cv2.COLOR_BGR2RGB)
+                                    
                                     if self.is_pointcloud_enabled.get(device_id, False):
                                         points = self.pc.calculate(frame_data)
                                 elif stream_type.lower() == "color":
