@@ -4,6 +4,7 @@ from typing import Dict, List, Optional, Any, Set
 import pyrealsense2 as rs
 import numpy as np
 import cv2
+import traceback
 from app.core.errors import RealSenseError
 from app.models.device import DeviceInfo
 from app.models.sensor import SensorInfo, SupportedStreamProfile
@@ -37,7 +38,7 @@ class RealSenseManager:
         
         # Initialize filters
         self.decimation_filter = rs.decimation_filter()
-        self.decimation_filter.set_option(rs.option.filter_magnitude, 2) # Reduced from 6 for better detail
+        self.decimation_filter.set_option(rs.option.filter_magnitude, 3) # Increased from 2 to 3 for performance
         self.spatial_filter = rs.spatial_filter()
         self.temporal_filter = rs.temporal_filter()
         self.hole_filling_filter = rs.hole_filling_filter()
@@ -704,177 +705,191 @@ class RealSenseManager:
                     if align_processor:
                         frames = align_processor.process(frames)
 
-                    # Extract individual frames and add to queues
+                    # === 阶段1: 在锁内仅完成 RealSense 硬件滤波和原始数据提取 ===
+                    raw_frames = {}  # 存储原始帧数据，锁外处理
+                    active_streams_snapshot = []
+                    should_break = False
+
                     with self.lock:
                         if device_id not in self.frame_queues:
-                            break
+                            should_break = True
+                        else:
+                            active_streams_snapshot = list(self.active_streams[device_id])
 
-                        # Pre-process depth frame with filters if available
-                        depth_frame = frames.get_depth_frame()
-                        if depth_frame:
-                            depth_frame = self.decimation_filter.process(depth_frame)
-                            depth_frame = self.threshold_filter.process(depth_frame)
-                            depth_frame = self.spatial_filter.process(depth_frame)
-                            depth_frame = self.temporal_filter.process(depth_frame)
+                            # RealSense 硬件滤波必须在帧有效期内完成
+                            depth_frame = frames.get_depth_frame()
+                            if depth_frame:
+                                depth_frame = self.decimation_filter.process(depth_frame)
+                                depth_frame = self.threshold_filter.process(depth_frame)
+                                depth_frame = self.spatial_filter.process(depth_frame)
+                                depth_frame = self.temporal_filter.process(depth_frame)
 
-                        for stream_type in self.active_streams[device_id]:
-                            stream_name_list = stream_type.split("-")
-                            stream_type = stream_name_list[0]
-                            rs_stream = None
-                            for name, val in rs.stream.__members__.items():
-                                if name.lower() == stream_type.lower():
-                                    rs_stream = val
-                                    break
+                            for stream_type in active_streams_snapshot:
+                                stream_name_list = stream_type.split("-")
+                                stype = stream_name_list[0]
 
-                            if rs_stream is None:
-                                continue
-
-                            try:
-                                frame = None
-                                frame_data = None
-                                points = None
-                                if stream_type.lower() == "depth":
-                                    # Use the filtered depth_frame if it exists
-                                    frame_data = depth_frame if depth_frame else frames.get_depth_frame()
-                                    # Convert to numpy array
-                                    depth_image = np.asanyarray(frame_data.get_data())
-                                    # Normalize depth image to 0-255 range for visualization
-                                    # Use a reasonable max distance (e.g. 5 meters = 5000mm) or dynamic range
-                                    # dynamic: cv2.normalize(depth_image, None, 0, 255, cv2.NORM_MINMAX)
-                                    # But dynamic can flicker. Let's use adaptive histogram or simple scaling.
-                                    # Simple min-max normalization for full range utilization:
-                                    depth_normalized = cv2.normalize(depth_image, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
-                                    # Apply Inferno colormap
-                                    depth_colormap = cv2.applyColorMap(depth_normalized, cv2.COLORMAP_INFERNO)
-                                    
-                                    # integrated edge detection
-                                    # Apply Canny edge detection
-                                    edges = cv2.Canny(depth_normalized, 100, 150)
-                                    # Dilate edges slightly to make them more visible
-                                    edges = cv2.dilate(edges, None)
-                                    # Overlay edges on the colormap (Black edges)
-                                    depth_colormap[edges > 0] = [0, 0, 0]
-
-                                    # Convert BGR to RGB (OpenCV is BGR, WebRTC expects RGB)
-                                    frame = cv2.cvtColor(depth_colormap, cv2.COLOR_BGR2RGB)
-                                    
-                                    if self.is_pointcloud_enabled.get(device_id, False):
-                                        points = self.pc.calculate(frame_data)
-                                elif stream_type.lower() == "color":
-                                    frame_data = frames.get_color_frame()
-                                    frame = frame_data.get_data()
-                                elif stream_type.lower() == "infrared":
-                                    frame_data = frames.get_infrared_frame(
-                                        int(stream_name_list[1])
-                                    )
-                                    frame = frame_data.get_data()
-                                elif (
-                                    stream_type == rs.stream.gyro.name
-                                    or stream_type == rs.stream.accel.name
-                                ):
-                                    motion_data = None
-                                    frame_data = None
-                                    for f in frames:
-                                        if f.get_profile().stream_type().name == stream_type:
-                                            frame_data = f.as_motion_frame()
-                                            motion_data = frame_data.get_motion_data()
-
-                                    motion_json_data = None
-                                    if motion_data:
-                                        motion_json_data = {
-                                            "x": float(motion_data.x),
-                                            "y": float(motion_data.y),
-                                            "z": float(motion_data.z),
+                                try:
+                                    if stype.lower() == "depth":
+                                        frame_data = depth_frame if depth_frame else frames.get_depth_frame()
+                                        if frame_data is None:
+                                            continue
+                                        # 仅拷贝原始数据，锁外做 OpenCV 后处理
+                                        data_array = np.asanyarray(frame_data.get_data()).copy()
+                                        raw_frames[stream_type] = {
+                                            "type": "depth",
+                                            "data": data_array,
+                                            "timestamp": frame_data.get_timestamp(),
+                                            "frame_number": frame_data.get_frame_number(),
+                                            "width": data_array.shape[1],
+                                            "height": data_array.shape[0],
+                                            "frame_data": frame_data,  # 保留引用用于点云计算
                                         }
-
-                                    if motion_data is None:
-                                        continue
-                                    text = f"x: {motion_data.x:.6f}\ny: {motion_data.y:.6f}\nz: {motion_data.z:.6f}".split(
-                                        "\n"
-                                    )
-                                    frame = np.zeros(
-                                        (480, 640, 3), dtype=np.uint8
-                                    )  # probably better load an image instead: image = cv2.imread(path)
-                                    y0, dy = 50, 40
-                                    for i, coord in enumerate(text):
-                                        y = y0 + dy * i
-                                        cv2.putText(
-                                            frame,
-                                            coord,
-                                            (10, y),
-                                            cv2.FONT_HERSHEY_SIMPLEX,
-                                            1,
-                                            (255, 255, 255),
-                                            2,
-                                            cv2.LINE_AA,
+                                    elif stype.lower() == "color":
+                                        frame_data = frames.get_color_frame()
+                                        if frame_data is None:
+                                            continue
+                                        data_array = np.asanyarray(frame_data.get_data()).copy()
+                                        raw_frames[stream_type] = {
+                                            "type": "color",
+                                            "data": data_array,
+                                            "timestamp": frame_data.get_timestamp(),
+                                            "frame_number": frame_data.get_frame_number(),
+                                            "width": data_array.shape[1],
+                                            "height": data_array.shape[0],
+                                        }
+                                    elif stype.lower() == "infrared":
+                                        frame_data = frames.get_infrared_frame(
+                                            int(stream_name_list[1])
                                         )
-                                else:
+                                        if frame_data is None:
+                                            continue
+                                        data_array = np.asanyarray(frame_data.get_data()).copy()
+                                        raw_frames[stream_type] = {
+                                            "type": "infrared",
+                                            "data": data_array,
+                                            "timestamp": frame_data.get_timestamp(),
+                                            "frame_number": frame_data.get_frame_number(),
+                                            "width": data_array.shape[1],
+                                            "height": data_array.shape[0],
+                                        }
+                                    elif (
+                                        stype == rs.stream.gyro.name
+                                        or stype == rs.stream.accel.name
+                                    ):
+                                        motion_data = None
+                                        frame_data = None
+                                        for f in frames:
+                                            if f.get_profile().stream_type().name == stype:
+                                                frame_data = f.as_motion_frame()
+                                                motion_data = frame_data.get_motion_data()
+                                        if motion_data is None:
+                                            continue
+                                        raw_frames[stream_type] = {
+                                            "type": "motion",
+                                            "motion_data": motion_data,
+                                            "timestamp": frame_data.get_timestamp(),
+                                            "frame_number": frame_data.get_frame_number(),
+                                            "width": 640,
+                                            "height": 480,
+                                        }
+                                    # 点云数据也在锁内计算（需要 frame_data 引用）
+                                    if stype.lower() == "depth" and self.is_pointcloud_enabled.get(device_id, False):
+                                        fd = raw_frames.get(stream_type, {}).get("frame_data")
+                                        if fd:
+                                            pts = self.pc.calculate(fd)
+                                            v = pts.get_vertices()
+                                            verts = np.asanyarray(v).view(np.float32).reshape(-1, 3).copy()
+                                            verts = verts[verts[:, 2] >= 0.03]
+                                            raw_frames[stream_type]["point_cloud"] = {
+                                                "vertices": verts,
+                                                "texture_coordinates": [],
+                                            }
+                                except RuntimeError:
                                     pass
 
-                                # Add metadata
-                                if frame_data is None:
-                                    continue
-                                metadata = {
-                                    "timestamp": frame_data.get_timestamp(),
-                                    "frame_number": frame_data.get_frame_number(),
-                                    "width": getattr(
-                                        frame_data, "get_width", lambda: 640
-                                    )()
-                                    or 640,
-                                    "height": getattr(
-                                        frame_data, "get_height", lambda: 480
-                                    )()
-                                    or 480,
+                    if should_break:
+                        break
+
+                    # === 阶段2: 锁外完成所有 OpenCV 后处理与队列操作 ===
+                    for stream_type, raw in raw_frames.items():
+                        stream_name_list = stream_type.split("-")
+                        stype = stream_name_list[0]
+
+                        try:
+                            frame = None
+                            metadata = {
+                                "timestamp": raw["timestamp"],
+                                "frame_number": raw["frame_number"],
+                                "width": raw["width"],
+                                "height": raw["height"],
+                            }
+
+                            if raw["type"] == "depth":
+                                depth_image = raw["data"]
+                                # 归一化、伪彩色、边缘检测 — 全部无锁执行
+                                depth_normalized = cv2.normalize(depth_image, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
+                                depth_colormap = cv2.applyColorMap(depth_normalized, cv2.COLORMAP_INFERNO)
+                                edges = cv2.Canny(depth_normalized, 25, 100)
+                                edges = cv2.dilate(edges, None)
+                                depth_colormap[edges > 0] = [0, 0, 0]
+                                frame = cv2.cvtColor(depth_colormap, cv2.COLOR_BGR2RGB)
+
+                                if "point_cloud" in raw:
+                                    metadata["point_cloud"] = raw["point_cloud"]
+
+                            elif raw["type"] == "color":
+                                frame = raw["data"]
+
+                            elif raw["type"] == "infrared":
+                                frame = raw["data"]
+
+                            elif raw["type"] == "motion":
+                                motion_data = raw["motion_data"]
+                                motion_json_data = {
+                                    "x": float(motion_data.x),
+                                    "y": float(motion_data.y),
+                                    "z": float(motion_data.z),
                                 }
+                                metadata["motion_data"] = motion_json_data
+                                text = f"x: {motion_data.x:.6f}\ny: {motion_data.y:.6f}\nz: {motion_data.z:.6f}".split("\n")
+                                frame = np.zeros((480, 640, 3), dtype=np.uint8)
+                                y0, dy = 50, 40
+                                for i, coord in enumerate(text):
+                                    y = y0 + dy * i
+                                    cv2.putText(
+                                        frame, coord, (10, y),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 1,
+                                        (255, 255, 255), 2, cv2.LINE_AA,
+                                    )
 
-                                if (
-                                    stream_type == rs.stream.gyro.name
-                                    or stream_type == rs.stream.accel.name
-                                ):
-                                    if motion_json_data:
-                                        metadata["motion_data"] = motion_json_data
+                            if frame is None:
+                                continue
 
-                                if points:
-                                    v = points.get_vertices()
-                                    _texcoords = points.get_texture_coordinates()
-                                    verts = (
-                                        np.asanyarray(v).view(np.float32).reshape(-1, 3)
-                                    )  # xyz
-                                    verts = verts[
-                                        verts[:, 2] >= 0.03
-                                    ]  # Filter out values where z < 0.03
-                                    # texcoords = np.asanyarray(t).view(np.float32).reshape(-1, 2)  # uv
-                                    metadata["point_cloud"] = {
-                                        "vertices": verts,
-                                        "texture_coordinates": [],
-                                    }
+                            frame = np.asanyarray(frame)
 
-                                frame = np.asanyarray(frame)
-
-                                # Add to queue
-                                frame_queue = self.frame_queues[device_id][
-                                    "-".join(stream_name_list)
-                                ]
+                            # 队列操作（使用锁保护队列本身的一致性）
+                            with self.lock:
+                                if device_id not in self.frame_queues:
+                                    break
+                                stream_key = "-".join(stream_name_list)
+                                frame_queue = self.frame_queues[device_id][stream_key]
                                 frame_queue.append(frame)
-
-                                metadata_queue = self.metadata_queues[device_id][
-                                    "-".join(stream_name_list)
-                                ]
-                                metadata_queue.append(metadata)
-
-                                # Keep queue size limited
                                 while len(frame_queue) > self.max_queue_size:
                                     frame_queue.pop(0)
 
+                                metadata_queue = self.metadata_queues[device_id][stream_key]
+                                metadata_queue.append(metadata)
                                 while len(metadata_queue) > self.max_queue_size:
                                     metadata_queue.pop(0)
-                            except RuntimeError:
-                                # Frame may not be available for this stream type
-                                pass
 
-                except RuntimeError as e:
+                        except Exception as e:
+                            print(f"[ERROR] Processing frame for {stream_type}: {e}")
+                            traceback.print_exc()
+
+                except Exception as e: # Catch all exceptions in the main loop
                     # Handle timeout or other error
-                    print(f"Error collecting frames: {str(e)}")
+                    print(f"Error collecting frames loop: {str(e)}")
+                    traceback.print_exc()
                     time.sleep(0.1)
 
         except Exception as e:
