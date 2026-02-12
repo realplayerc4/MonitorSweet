@@ -46,6 +46,10 @@ class RealSenseManager:
         self.colorizer.set_option(rs.option.histogram_equalization_enabled, 1) # Enable histogram equalization
         self.colorizer.set_option(rs.option.min_distance, 0.2) # Minimum distance (meters)
         self.colorizer.set_option(rs.option.max_distance, 6.0) # Maximum distance (meters)
+        
+        self.threshold_filter = rs.threshold_filter()
+        self.threshold_filter.set_option(rs.option.min_distance, 0.1) # Min distance 0.1m
+        self.threshold_filter.set_option(rs.option.max_distance, 4.0) # Max distance 4.0m
 
         self.metadata_socket_server = MetadataSocketServer(sio, self)
 
@@ -709,6 +713,7 @@ class RealSenseManager:
                         depth_frame = frames.get_depth_frame()
                         if depth_frame:
                             depth_frame = self.decimation_filter.process(depth_frame)
+                            depth_frame = self.threshold_filter.process(depth_frame)
                             depth_frame = self.spatial_filter.process(depth_frame)
                             depth_frame = self.temporal_filter.process(depth_frame)
 
